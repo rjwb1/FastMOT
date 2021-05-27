@@ -1,8 +1,7 @@
 import ctypes
-import pycuda.autoinit
+#import pycuda.autoinit
 import pycuda.driver as cuda
 import tensorrt as trt
-
 
 class HostDeviceMem:
     def __init__(self, host_mem, device_mem):
@@ -24,7 +23,8 @@ class InferenceBackend:
     def __init__(self, model, batch_size):
         self.model = model
         self.batch_size = batch_size
-
+        cuda.init()
+        self.cfx = cuda.Device(0).make_context()
         # load plugin if the model requires one
         if self.model.PLUGIN_PATH is not None:
             try:
@@ -44,8 +44,7 @@ class InferenceBackend:
             raise RuntimeError('Unable to load the engine file')
         if self.engine.has_implicit_batch_dimension:
             assert self.batch_size <= self.engine.max_batch_size
-
-        # allocate buffers
+        
         self.bindings = []
         self.outputs = []
         for binding in self.engine:
@@ -65,12 +64,12 @@ class InferenceBackend:
                 self.input = HostDeviceMem(host_mem, device_mem)
             else:
                 self.outputs.append(HostDeviceMem(host_mem, device_mem))
-        self.context = self.engine.create_execution_context()
         self.stream = cuda.Stream()
-
+        self.context = self.engine.create_execution_context()    
         # timing events
         self.start = cuda.Event()
         self.end = cuda.Event()
+        self.cfx.pop()
 
     @property
     def input_handle(self):
@@ -86,18 +85,22 @@ class InferenceBackend:
 
     def infer_async(self):
         self.start.record(self.stream)
-        cuda.memcpy_htod_async(self.input.device, self.input.host, self.stream)
-        if self.engine.has_implicit_batch_dimension:
-            self.context.execute_async(batch_size=self.batch_size, bindings=self.bindings,
-                                       stream_handle=self.stream.handle)
-        else:
-            self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        self.cfx.push()
+        stream = self.stream
+        context = self.context
+        engine  = self.engine
+        bindings = self.bindings
+        input_ = self.input
+        self.start.record(self.stream)
+        cuda.memcpy_htod_async(input_.device, input_.host, stream)
+        self.context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
         for out in self.outputs:
             cuda.memcpy_dtoh_async(out.host, out.device, self.stream)
         self.end.record(self.stream)
-
+        
     def synchronize(self):
         self.stream.synchronize()
+        self.cfx.pop()
         return [out.host for out in self.outputs]
 
     def get_infer_time(self):
